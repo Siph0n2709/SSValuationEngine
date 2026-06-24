@@ -1,0 +1,17 @@
+# secrets
+.env
+*.key
+
+# cached API data
+data/raw/
+data_cache/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# os
+.DS_Store
