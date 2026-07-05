@@ -1,182 +1,133 @@
-#!/usr/bin/env python3
 """
-Data layer -- pull the full universe and build the base dataset.
+Build the EBITDA layer across my full 14-name universe, straight from EDGAR.
 
-For every ticker in the universe this:
-  1. pulls income statement, balance sheet, cash flow, and profile from FMP
-  2. caches each raw response (re-runs cost zero requests)
-  3. computes EBITDA the canonical way we settled on in the spike:
-        EBITDA = operating income + D&A
-     deliberately NOT FMP's reported `ebitda` field, which folds in
-     non-operating income (interest on cash, investment gains) and would
-     make cash-rich names look artificially cheap.
-  4. computes enterprise value = market cap + total debt - cash
-  5. lays it all out in a segment-sorted table and writes a CSV
+This is the spike scaled up: operating income + full D&A, run over every in-scope
+ticker. It doubles as a quality gate -- stale filings or missing D&A get flagged with
+their actual available tags, and a D&A cross-check shows where a filer's combined line
+disagrees with depreciation+intangible-amortization, so no understatement slips through.
 
-D&A is taken from the CASH FLOW statement, not the income statement -- it's the
-more complete figure (picks up amortization the income statement can bury).
-
-Usage:
-    set FMP_API_KEY=your_key        (cmd)   or   $env:FMP_API_KEY="your_key"  (PowerShell)
-    python src\\build_dataset.py
-
-Requests: 4 per name x 14 names = 56. Free tier is 250/day, and caching means
-re-runs are free.
+Balance-sheet items (debt, cash, shares) and price/market cap are later passes.
+NVDA stays my ground truth throughout.
 """
 
-import os
 import sys
-import json
 from pathlib import Path
-from urllib.parse import urlencode
-from urllib.request import urlopen
-from urllib.error import HTTPError, URLError
 
 import pandas as pd
 
-# make `data.universe` importable whether you run from root or src/
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from data.universe import UNIVERSE, segment_of  # noqa: E402
+# universe.py lives in src/ (I moved it out of data/raw, which is gitignored). I make
+# sure src/, data/, and root are all importable no matter where I launch from.
+_ROOT = Path(__file__).resolve().parent.parent
+for _p in (_ROOT / "src", _ROOT / "data", _ROOT):
+    sys.path.insert(0, str(_p))
 
-BASE = "https://financialmodelingprep.com/stable"
-CACHE_DIR = Path("data/raw")
-OUTPUT_CSV = Path("data/dataset.csv")
+import edgar
+from universe import UNIVERSE, all_tickers, segment_of
 
-
-# --------------------------------------------------------------------------
-# Plumbing (same fetch/pick helpers as the spike, lightly generalized)
-# --------------------------------------------------------------------------
-
-def get_key():
-    key = os.environ.get("FMP_API_KEY")
-    if not key:
-        sys.exit("ERROR: set FMP_API_KEY first. Get a free key at "
-                 "https://site.financialmodelingprep.com/developer/docs/dashboard")
-    return key
+NVDA_EBITDA_TARGET = 133.23e9
+OUT = edgar.ROOT / "data" / "processed"
+OUT.mkdir(parents=True, exist_ok=True)
 
 
-def fetch(endpoint, key, use_cache=True, **params):
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    sym = params.get("symbol", "x")
-    cache_file = CACHE_DIR / f"{sym}_{endpoint.replace('/', '_')}.json"
-
-    if use_cache and cache_file.exists():
-        return json.loads(cache_file.read_text())
-
-    params["apikey"] = key
-    url = f"{BASE}/{endpoint}?{urlencode(params)}"
-    try:
-        with urlopen(url, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
-    except HTTPError as e:
-        if e.code == 403:
-            sys.exit(f"ERROR 403 on '{endpoint}' for {sym}: not on free tier.")
-        sys.exit(f"ERROR {e.code} on '{endpoint}' for {sym}: {e.reason}")
-    except URLError as e:
-        sys.exit(f"NETWORK ERROR on '{endpoint}' for {sym}: {e.reason}")
-
-    if isinstance(data, dict) and ("Error Message" in data or not data):
-        sys.exit(f"FMP error for {sym}/{endpoint}: {data}")
-    if not data:
-        sys.exit(f"Empty data for {sym}/{endpoint}.")
-
-    cache_file.write_text(json.dumps(data, indent=2))
-    return data
+def _name_of(ticker):
+    for members in UNIVERSE.values():
+        if ticker in members:
+            return members[ticker]
+    return ticker
 
 
-def pick(d, *names, required=True, label=""):
-    for n in names:
-        if n in d and d[n] is not None:
-            return d[n]
-    if required:
-        sys.exit(f"MISSING FIELD {label}: none of {names}.\nKeys: {sorted(d.keys())}")
-    return 0
+def _b(x):
+    return "--" if x is None else f"{x/1e9:.2f}"
 
 
-# --------------------------------------------------------------------------
-# Per-company metric build
-# --------------------------------------------------------------------------
-
-def build_row(ticker, name, key):
-    """Pull one company and return a dict of computed metrics."""
-    income = fetch("income-statement", key, symbol=ticker, period="annual", limit=1)[0]
-    balance = fetch("balance-sheet-statement", key, symbol=ticker, period="annual", limit=1)[0]
-    cashflow = fetch("cash-flow-statement", key, symbol=ticker, period="annual", limit=1)[0]
-    profile = fetch("profile", key, symbol=ticker)[0]
-
-    # --- canonical operating EBITDA: EBIT + D&A (D&A from cash flow stmt) ---
-    operating_income = pick(income, "operatingIncome", label=f"{ticker} EBIT")
-    da = pick(cashflow, "depreciationAndAmortization", label=f"{ticker} D&A")
-    ebitda = operating_income + da
-
-    # --- enterprise value ---
-    market_cap = pick(profile, "marketCap", "mktCap", label=f"{ticker} mktcap")
-    total_debt = pick(balance, "totalDebt", required=False)
-    if total_debt == 0:
-        total_debt = (pick(balance, "shortTermDebt", required=False)
-                      + pick(balance, "longTermDebt", required=False))
-    cash = pick(balance, "cashAndCashEquivalents",
-                "cashAndShortTermInvestments", required=False)
-    ev = market_cap + total_debt - cash
-
-    revenue = pick(income, "revenue", required=False)
-
-    return {
-        "ticker": ticker,
-        "company": name,
-        "segment": segment_of(ticker),
-        "fiscal_date": pick(income, "date", required=False),
-        "revenue": revenue,
-        "operating_income": operating_income,
-        "da": da,
-        "ebitda": ebitda,
-        "ebitda_margin": ebitda / revenue if revenue else None,
-        "market_cap": market_cap,
-        "total_debt": total_debt,
-        "cash": cash,
-        "enterprise_value": ev,
-        "ev_ebitda": ev / ebitda if ebitda else None,
-    }
-
-
-def main():
-    key = get_key()
+def build():
     rows = []
+    flagged = []      # (ticker, reason, facts) for names I couldn't build cleanly
+    crosscheck = []   # (ticker, combined, summed, used) to expose D&A disagreements
 
-    for segment, members in UNIVERSE.items():
-        for ticker, name in members.items():
-            print(f"  pulling {ticker:6} ({segment})...")
-            rows.append(build_row(ticker, name, key))
+    for ticker in all_tickers():
+        cik, doc = edgar.company_facts(ticker)
+        if not doc:
+            flagged.append((ticker, "couldn't resolve CIK / fetch facts", None))
+            continue
+
+        facts = doc.get("facts", {})
+        result = edgar.ebitda_for(facts)
+        base = {
+            "ticker": ticker, "name": _name_of(ticker), "segment": segment_of(ticker),
+            "period_end": result.get("period_end"),
+            "operating_income": result.get("operating_income"),
+        }
+
+        if not result["ok"]:
+            flagged.append((ticker, result["reason"], facts))
+            rows.append({**base, "da": None, "da_tag": None,
+                         "ebitda": None, "status": result["reason"]})
+            continue
+
+        info = result["da_info"]
+        crosscheck.append((ticker, info["combined"], info["summed"], info["method"]))
+        # If I had to use the summed figure because the combined line came in materially
+        # lower, that's the intangible-amort fix firing -- I note it so it's not invisible.
+        status = "ok"
+        if (info["method"] == "summed" and info["combined"] is not None
+                and info["summed"] > info["combined"] * 1.05):
+            status = "ok (summed > combined)"
+
+        rows.append({**base, "da": result["da"], "da_tag": result["da_tag"],
+                     "ebitda": result["ebitda"], "status": status})
 
     df = pd.DataFrame(rows)
-    # sort by segment, then by the multiple within each segment
-    df = df.sort_values(["segment", "ev_ebitda"]).reset_index(drop=True)
 
-    OUTPUT_CSV.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(OUTPUT_CSV, index=False)
-
-    # readable console view, $B where it helps
     show = df.copy()
-    for col in ["revenue", "ebitda", "market_cap", "enterprise_value"]:
-        show[col] = (show[col] / 1e9).round(1)
-    show["ebitda_margin"] = (show["ebitda_margin"] * 100).round(1)
-    show["ev_ebitda"] = show["ev_ebitda"].round(1)
+    for col in ("operating_income", "da", "ebitda"):
+        show[col] = (show[col] / 1e9).round(2)
+    show = show.rename(columns={
+        "operating_income": "EBIT($B)", "da": "D&A($B)", "ebitda": "EBITDA($B)"})
+    print(show[["ticker", "segment", "period_end",
+                "EBIT($B)", "D&A($B)", "EBITDA($B)", "status"]].to_string(index=False))
+    print()
 
-    pd.set_option("display.max_columns", None)
-    pd.set_option("display.width", 200)
-    print("\n" + "=" * 70)
-    print("  BASE DATASET  (revenue / ebitda / mkt cap / EV in $B)")
-    print("=" * 70)
-    for seg in df["segment"].unique():
-        print(f"\n{seg.upper()}")
-        cols = ["ticker", "company", "revenue", "ebitda", "ebitda_margin",
-                "enterprise_value", "ev_ebitda"]
-        print(show[show["segment"] == seg][cols].to_string(index=False))
+    # Oracle check.
+    nvda = df[df["ticker"] == "NVDA"]
+    if not nvda.empty and pd.notna(nvda.iloc[0]["ebitda"]):
+        got = float(nvda.iloc[0]["ebitda"])
+        off = abs(got - NVDA_EBITDA_TARGET) / NVDA_EBITDA_TARGET * 100
+        verdict = "matches spike" if off <= 1.0 else "DRIFTED -- investigate"
+        print(f"Oracle check -- NVDA EBITDA ${got/1e9:.2f}B vs spike "
+              f"${NVDA_EBITDA_TARGET/1e9:.2f}B (off {off:.2f}%) -> {verdict}")
 
-    print(f"\nSaved {len(df)} rows to {OUTPUT_CSV}")
-    print("\nEyeball check: do the EV/EBITDA multiples rank sensibly within each")
-    print("segment? Any name that looks absurd is the next thing to dig into.")
+    # D&A cross-check: where combined and summed disagree, I want to see it by eye.
+    print("\nD&A cross-check ($B)  [combined line vs depreciation+intangible-amort]")
+    for tkr, comb, summ, used in crosscheck:
+        gap = ""
+        if comb is not None and summ is not None and comb > 0:
+            diff = abs(summ - comb) / comb * 100
+            if diff > 5:
+                gap = f"  <-- differ {diff:.0f}%"
+        print(f"  {tkr:6} combined={_b(comb):>7}  summed={_b(summ):>7}  used={used}{gap}")
+
+    # Diagnostics for anything I couldn't build: dump the filer's real tags.
+    if flagged:
+        print(f"\n{'='*70}\nFLAGGED -- {len(flagged)} name(s) need a look\n{'='*70}")
+        for ticker, reason, facts in flagged:
+            print(f"\n{ticker}: {reason}")
+            if facts is None:
+                continue
+            print("  D&A / amortization tags:")
+            for t in edgar.available_tags(facts, "depreciation", "amortization"):
+                print(f"      {t}")
+            if "OperatingIncome" in reason or "stale" in reason:
+                print("  operating-income tags:")
+                for t in edgar.available_tags(facts, "operatingincome"):
+                    print(f"      {t}")
+    else:
+        print("\nAll 14 names built cleanly.")
+
+    out_path = OUT / "ebitda.csv"
+    df.to_csv(out_path, index=False)
+    print(f"\nSaved -> {out_path.relative_to(edgar.ROOT)}")
 
 
 if __name__ == "__main__":
-    main()
+    build()

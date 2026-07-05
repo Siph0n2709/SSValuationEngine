@@ -1,0 +1,15 @@
+ticker,name,segment,period_end,operating_income,da,da_tag,ebitda,status
+AMAT,Applied Materials,equipment,2025-10-26,8289000000,435000000.0,DepreciationAndAmortization,8724000000.0,ok
+LRCX,Lam Research,equipment,2025-06-29,5900968000,386277000.0,DepreciationAndAmortization,6287245000.0,ok
+KLAC,KLA Corporation,equipment,2014-06-30,772070000,,,,stale period 2014-06-30 (4388d old)
+TER,Teradyne,equipment,2025-12-31,650051000,127981000.0,DepreciationDepletionAndAmortization,778032000.0,ok
+MKSI,MKS Instruments,equipment,2025-12-31,528000000,344000000.0,DepreciationAndAmortization,872000000.0,ok
+ENTG,Entegris,equipment,2025-12-31,455900000,389700000.0,Depreciation+AmortizationOfIntangibleAssets,845600000.0,ok (summed > combined)
+NVDA,NVIDIA,designer,2026-01-25,130387000000,2888000000.0,Depreciation+AmortizationOfIntangibleAssets,133275000000.0,ok
+AVGO,Broadcom,designer,2025-11-02,25484000000,8636000000.0,Depreciation+AmortizationOfIntangibleAssets,34120000000.0,ok
+QCOM,Qualcomm,designer,2025-09-28,12355000000,1621000000.0,Depreciation+AmortizationOfIntangibleAssets,13976000000.0,ok
+AMD,Advanced Micro Devices,designer,2025-12-27,3694000000,2821000000.0,Depreciation+AmortizationOfIntangibleAssets,6515000000.0,ok
+TXN,Texas Instruments,designer,2025-12-31,6023000000,1918000000.0,Depreciation,7941000000.0,ok
+MRVL,Marvell Technology,designer,2026-01-31,1322900000,1163700000.0,Depreciation+AmortizationOfIntangibleAssets,2486600000.0,ok
+MPWR,Monolithic Power Systems,designer,2025-12-31,728636000,52513000.0,DepreciationDepletionAndAmortization,781149000.0,ok
+LSCC,Lattice Semiconductor,designer,2026-01-03,11232000,22146000.0,Depreciation+AmortizationOfIntangibleAssets,33378000.0,ok
