@@ -26,7 +26,7 @@ if not USER_AGENT:
     sys.exit(
         'ERROR: no SEC contact set.\n'
         '  SEC needs a User-Agent identifying me or it blocks the request.\n'
-        '  Run:  $env:SEC_USER_AGENT="Agnivesh Kaundinya akaundinya06@gmail.com"'
+        '  Run:  $env:SEC_USER_AGENT="Your Name your_email@example.com"'
     )
 
 SESSION = requests.Session()
@@ -38,15 +38,12 @@ RAW = ROOT / "data" / "raw"
 RAW.mkdir(parents=True, exist_ok=True)
 
 # For EBITDA I want the FULL D&A add-back: depreciation AND amortization of intangibles.
-# Some filers report it as one combined cash-flow line...
 COMBINED_DA_TAGS = [
     "DepreciationDepletionAndAmortization",
     "DepreciationAmortizationAndAccretionNet",
     "DepreciationAndAmortization",
 ]
-# ...others split it (Broadcom, AMD, Marvell), where bare Depreciation is only the property
-# piece and drops billions of intangible amortization. So I also build depreciation +
-# intangible amortization and take whichever is more complete (see da_for_period).
+# ...if a filer splits it, bare Depreciation drops intangible amort, so I sum the pieces.
 AMORT_TAGS = [
     "AmortizationOfIntangibleAssets",
     "AmortizationOfIntangibleAssetsAndOtherAmortization",
@@ -54,11 +51,26 @@ AMORT_TAGS = [
     "FiniteLivedIntangibleAssetsAmortizationExpense",
 ]
 
+# Revenue / cost tags I use to reconstruct operating income when the direct tag is gone.
+REVENUE_TAGS = [
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
+    "Revenues",
+]
+COST_OF_REVENUE_TAGS = [
+    "CostOfRevenue",
+    "CostOfGoodsAndServicesSold",
+]
+SGA_TAGS = [
+    "SellingGeneralAndAdministrativeExpense",
+    "GeneralAndAdministrativeExpense",
+]
+
 # A full fiscal year is ~365 days. I select annual figures by actual period length, not by
 # fp/form flags -- those are coded inconsistently across filers (that's what sent KLAC to a
 # 2014 filing). 52/53-week years land at 364/371, so this window catches them all.
 ANNUAL_MIN_DAYS = 340
 ANNUAL_MAX_DAYS = 380
+STALE_AFTER_DAYS = 500  # if even the newest annual figure is older than this, don't trust it
 
 _COURTESY_DELAY = 0.15  # brief pause between live SEC calls to stay well under their 10/sec
 
@@ -119,7 +131,6 @@ def latest_annual(facts, tag, unit="USD"):
     annual = [r for r in node.get("units", {}).get(unit, []) if _is_annual(r)]
     if not annual:
         return None
-    # Latest fiscal-year end wins; a period restated in a later filing breaks the tie.
     return max(annual, key=lambda r: (r["end"], r.get("filed", "")))
 
 
@@ -135,6 +146,60 @@ def annual_value_for_end(facts, tag, end_date, unit="USD"):
     if not matches:
         return None
     return max(matches, key=lambda r: r.get("filed", ""))["val"]
+
+
+def _first_annual_for_end(facts, tags, end):
+    """First of several candidate tags that has an annual value at this period-end."""
+    for t in tags:
+        v = annual_value_for_end(facts, t, end)
+        if v is not None:
+            return v
+    return None
+
+
+def operating_income_for(facts):
+    """
+    Operating income for the latest fiscal year.
+    I use the tagged OperatingIncomeLoss when it's current. When a filer stops tagging it
+    (KLA did after 2015), I reconstruct it from income-statement components at the same
+    period-end, in priority order. Returns (value, end, method).
+    """
+    # 1. Direct tag, if it isn't stale.
+    row = latest_annual(facts, "OperatingIncomeLoss")
+    if row:
+        age = (datetime.date.today() - datetime.date.fromisoformat(row["end"])).days
+        if age <= STALE_AFTER_DAYS:
+            return row["val"], row["end"], "OperatingIncomeLoss"
+
+    # Reconstruct -- anchor everything on the latest annual revenue period.
+    rev_row = None
+    for t in REVENUE_TAGS:
+        rev_row = latest_annual(facts, t)
+        if rev_row:
+            break
+    if not rev_row:
+        return None, None, None
+    end, rev = rev_row["end"], rev_row["val"]
+
+    # 2. Gross profit minus operating expenses (cleanest when both subtotals are tagged).
+    gp = annual_value_for_end(facts, "GrossProfit", end)
+    opex = annual_value_for_end(facts, "OperatingExpenses", end)
+    if gp is not None and opex is not None:
+        return gp - opex, end, "GrossProfit-OpEx"
+
+    # 3. Revenue minus total costs-and-expenses (this subtotal already includes opex).
+    cae = annual_value_for_end(facts, "CostsAndExpenses", end)
+    if cae is not None:
+        return rev - cae, end, "Rev-CostsAndExpenses"
+
+    # 4. Revenue minus cost of revenue minus R&D minus SG&A (component build -- KLA lands here).
+    cor = _first_annual_for_end(facts, COST_OF_REVENUE_TAGS, end)
+    rd = annual_value_for_end(facts, "ResearchAndDevelopmentExpense", end)
+    sga = _first_annual_for_end(facts, SGA_TAGS, end)
+    if cor is not None and (rd is not None or sga is not None):
+        return rev - cor - (rd or 0) - (sga or 0), end, "Rev-CoR-RD-SGA"
+
+    return None, None, None
 
 
 def da_for_period(facts, end):
@@ -170,35 +235,24 @@ def da_for_period(facts, end):
     if a_val is None and b_val is None:
         return None
 
-    # Pick the larger (more complete) candidate.
     if b_val is not None and (a_val is None or b_val > a_val):
         value, label, method = b_val, b_label, "summed"
     else:
         value, label, method = a_val, a_tag, "combined"
 
-    return {
-        "value": value, "label": label, "method": method,
-        "combined": a_val, "summed": b_val,
-    }
+    return {"value": value, "label": label, "method": method,
+            "combined": a_val, "summed": b_val}
 
 
 def ebitda_for(facts):
     """
-    My EBITDA = operating income + D&A, both from the latest 10-K.
-    Anchors on OperatingIncomeLoss, guards against stale filings, builds a full D&A
-    add-back. Returns the pieces, or a reason it couldn't build one.
+    My EBITDA = operating income + D&A, both from the latest fiscal year.
+    Operating income comes from operating_income_for (direct tag or reconstruction);
+    D&A from da_for_period (full add-back). Returns the pieces, or a reason it failed.
     """
-    oi_row = latest_annual(facts, "OperatingIncomeLoss")
-    if not oi_row:
-        return {"ok": False, "reason": "no annual OperatingIncomeLoss"}
-    end = oi_row["end"]
-    oi = oi_row["val"]
-
-    # Staleness guard -- if even the newest annual figure is old, something's wrong.
-    age_days = (datetime.date.today() - datetime.date.fromisoformat(end)).days
-    if age_days > 500:
-        return {"ok": False, "reason": f"stale period {end} ({age_days}d old)",
-                "period_end": end, "operating_income": oi}
+    oi, end, oi_method = operating_income_for(facts)
+    if oi is None:
+        return {"ok": False, "reason": "no operating income (direct or reconstructed)"}
 
     da = da_for_period(facts, end)
     if da is None:
@@ -209,6 +263,7 @@ def ebitda_for(facts):
         "ok": True,
         "period_end": end,
         "operating_income": oi,
+        "oi_method": oi_method,
         "da": da["value"],
         "da_tag": da["label"],
         "da_info": da,

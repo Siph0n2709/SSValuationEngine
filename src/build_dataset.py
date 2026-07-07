@@ -73,6 +73,11 @@ def build():
         if (info["method"] == "summed" and info["combined"] is not None
                 and info["summed"] > info["combined"] * 1.05):
             status = "ok (summed > combined)"
+        # If operating income was reconstructed (not the direct tag), flag it too so I
+        # remember KLAC-style names aren't coming from a clean OperatingIncomeLoss line.
+        oi_method = result.get("oi_method")
+        if oi_method and oi_method != "OperatingIncomeLoss":
+            status = f"ok (OI: {oi_method})"
 
         rows.append({**base, "da": result["da"], "da_tag": result["da_tag"],
                      "ebitda": result["ebitda"], "status": status})
