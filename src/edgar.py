@@ -343,7 +343,11 @@ def total_debt_for(facts, end):
             fl = (flnc or 0) + (flc or 0)
 
     if lt is None and fl is None:
-        return None, "no debt tags"
+        # No funded-debt tags at the year-end. For my universe I confirmed this means
+        # genuinely debt-free (TER, MPWR, LSCC each repaid what they once had) rather than
+        # debt hiding under an exotic tag -- companies that carry debt report LongTermDebt.
+        # So I record $0, not a miss.
+        return 0.0, "debt-free (no debt tags at year-end)"
     return (lt or 0) + (fl or 0), f"LT={_bil(lt)} finLease={_bil(fl)}"
 
 

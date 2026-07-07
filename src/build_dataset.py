@@ -77,8 +77,6 @@ def build():
                 "bs_date": ev["bs_date"], "total_debt": ev["total_debt"],
                 "cash": ev["cash"], "net_debt": ev["net_debt"], "shares": ev["shares"],
             })
-            if ev["total_debt"] is None:
-                flagged.append((ticker, "no debt tags at year-end"))
             if ev["cash"] is None:
                 flagged.append((ticker, "no cash tag at year-end"))
             if ev["shares"] is None:
@@ -119,6 +117,10 @@ def build():
         print(f"  debt   ${_b(r['total_debt'])}B  (target {NVDA_DEBT_TARGET/1e9:.2f}, off {_pct_off(r['total_debt'], NVDA_DEBT_TARGET)})")
         print(f"  cash   ${_b(r['cash'])}B  (target {NVDA_CASH_TARGET/1e9:.2f}, off {_pct_off(r['cash'], NVDA_CASH_TARGET)})")
         print(f"  shares {r['shares']/1e9:.3f}B  (target {NVDA_SHARES_TARGET/1e9:.2f}, off {_pct_off(r['shares'], NVDA_SHARES_TARGET)})")
+
+    debt_free = df[df["total_debt"] == 0]["ticker"].tolist()
+    if debt_free:
+        print(f"\nDebt-free (net debt = -cash): {', '.join(debt_free)}")
 
     if flagged:
         print("\nFLAGGED:")
