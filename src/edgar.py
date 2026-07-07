@@ -276,3 +276,115 @@ def available_tags(facts, *needles):
     needles = [n.lower() for n in needles]
     keys = facts.get("us-gaap", {}).keys()
     return sorted(k for k in keys if any(n in k.lower() for n in needles))
+
+
+# --- Balance-sheet layer (instant facts) --------------------------------------------
+# Balance-sheet items are point-in-time (instant) facts: they carry 'end' but no 'start'.
+# I anchor everything to the latest 10-K year-end so net debt lines up with my annual
+# EBITDA, one consistent snapshot per name.
+
+BALANCE_ANCHOR_TAGS = [
+    "Assets",
+    "LiabilitiesAndStockholdersEquity",
+    "CashAndCashEquivalentsAtCarryingValue",
+]
+
+
+def _bil(x):
+    return "--" if x is None else f"{x/1e9:.2f}"
+
+
+def _instant_rows(facts, tag, unit="USD"):
+    node = facts.get("us-gaap", {}).get(tag)
+    if not node:
+        return []
+    return [r for r in node.get("units", {}).get(unit, [])
+            if r.get("end") and "start" not in r]
+
+
+def balance_sheet_date(facts):
+    """Latest fiscal-year-end balance-sheet date, anchored on a universal 10-K line."""
+    for tag in BALANCE_ANCHOR_TAGS:
+        rows = [r for r in _instant_rows(facts, tag)
+                if str(r.get("form", "")).startswith("10-K")]
+        if rows:
+            return max(rows, key=lambda r: (r["end"], r.get("filed", "")))["end"]
+    return None
+
+
+def instant_value_for_end(facts, tag, end, unit="USD"):
+    """A balance-sheet tag's value at one specific year-end (newest filing on ties)."""
+    rows = [r for r in _instant_rows(facts, tag, unit) if r.get("end") == end]
+    if not rows:
+        return None
+    return max(rows, key=lambda r: r.get("filed", ""))["val"]
+
+
+def total_debt_for(facts, end):
+    """
+    Total debt = long-term debt (incl. current portion) + finance leases.
+    Operating leases are EXCLUDED on purpose: my EBITDA is struck after operating-lease
+    expense, so adding the operating-lease liability to EV would double-count it (that's
+    the ~$2.9B FMP bundled into NVDA's 'total debt'). Returns (value, detail).
+    """
+    lt = instant_value_for_end(facts, "LongTermDebt", end)  # total line when reported
+    if lt is None:
+        nc = instant_value_for_end(facts, "LongTermDebtNoncurrent", end)
+        cur = (instant_value_for_end(facts, "LongTermDebtCurrent", end)
+               or instant_value_for_end(facts, "DebtCurrent", end))
+        if nc is not None or cur is not None:
+            lt = (nc or 0) + (cur or 0)
+
+    fl = instant_value_for_end(facts, "FinanceLeaseLiability", end)
+    if fl is None:
+        flnc = instant_value_for_end(facts, "FinanceLeaseLiabilityNoncurrent", end)
+        flc = instant_value_for_end(facts, "FinanceLeaseLiabilityCurrent", end)
+        if flnc is not None or flc is not None:
+            fl = (flnc or 0) + (flc or 0)
+
+    if lt is None and fl is None:
+        return None, "no debt tags"
+    return (lt or 0) + (fl or 0), f"LT={_bil(lt)} finLease={_bil(fl)}"
+
+
+def cash_for(facts, end):
+    """
+    Cash for net debt = cash & equivalents only.
+    I keep marketable securities OUT at the screen level: their tags are inconsistent
+    across filers and even across years for one filer (NVDA's changed year to year), while
+    cash & equivalents is universal and ties to my oracle exactly. I refine liquidity by
+    hand for the 2-3 names that reach the DCF stage, where precision actually matters.
+    """
+    return instant_value_for_end(facts, "CashAndCashEquivalentsAtCarryingValue", end)
+
+
+def shares_outstanding(facts):
+    """Most current shares outstanding -- the dei cover-page count, newer than the balance date."""
+    for ns, tag in [("dei", "EntityCommonStockSharesOutstanding"),
+                    ("us-gaap", "CommonStockSharesOutstanding")]:
+        node = facts.get(ns, {}).get(tag)
+        if not node:
+            continue
+        rows = [r for r in node.get("units", {}).get("shares", [])
+                if r.get("end") and "start" not in r]
+        if rows:
+            return max(rows, key=lambda r: (r["end"], r.get("filed", "")))["val"]
+    return None
+
+
+def ev_inputs(facts):
+    """The balance-sheet inputs for EV: total debt, cash, net debt, shares, at the year-end."""
+    end = balance_sheet_date(facts)
+    if end is None:
+        return {"ok": False, "reason": "no balance-sheet date"}
+    debt, detail = total_debt_for(facts, end)
+    cash = cash_for(facts, end)
+    return {
+        "ok": True,
+        "bs_date": end,
+        "total_debt": debt,
+        "debt_detail": detail,
+        "cash": cash,
+        "net_debt": (debt or 0) - (cash or 0),
+        "shares": shares_outstanding(facts),
+    }
