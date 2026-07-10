@@ -1,0 +1,91 @@
+SEMICONDUCTOR RELATIVE-VALUE SCREENER: PLAIN-ENGLISH NOTES
+(my own reference for the what and why of this project)
+
+
+WHAT THIS PROJECT IS
+
+* A tool that screens 14 US-listed semiconductor companies on EV/EBITDA and ranks each one against its segment peers to flag names that look cheap or expensive relative to the group.
+* Then it runs a full DCF on the 2 or 3 most interesting names the screen flags, to test whether the market's pricing is actually justified or is a real mispricing.
+* Purpose: a recruiting artifact for valuation, TAS, and corporate finance roles. My prior capstone was all price and return driven; this adds the fundamental, intrinsic-value lens. The pitch: "I cover semis from both angles, quant and fundamental."
+* What makes it credible: every number traces to a primary source (SEC filings), and every methodology choice is a defensible judgment call. It shows I know where financial data comes from and how it can lie.
+
+
+WHY EV/EBITDA IS THE CORE METRIC
+
+* EV (Enterprise Value) is market cap plus debt minus cash. It's the price of the whole business, not just the equity slice.
+* EV/EBITDA answers: how much am I paying for one dollar of the company's core operating cash generation?
+* Why it beats a simple P/E ratio:
+    * It's capital-structure neutral. P/E gets distorted by how much debt a company carries; EV/EBITDA doesn't, so I can compare a debt-heavy name (AVGO) with a debt-free one (MPWR) fairly.
+    * EBITDA strips out financing (interest), taxes, and accounting choices (depreciation and amortization) to get at the raw operating engine.
+* It's the standard multiple in M&A and comparable-companies analysis, because an acquirer buys the whole enterprise (takes the debt, gets the cash) and cares about operating cash flow. Building a screen on it makes me look like I think like a deal person.
+* This is why the definitional work mattered: a comp table is only as good as its worst-defined input. One wrong market cap or one dropped amortization line poisons the whole ranking.
+* Caveat: EV/EBITDA is a trailing, relative tool. It ignores growth (why AMD reads "n.m." at 120x plus, since its value is all forward-looking), and a low number isn't automatically cheap. The DCF fills that gap.
+
+
+THE UNIVERSE (14 NAMES)
+
+* Equipment (6): AMAT, LRCX, KLAC, TER, MKSI, ENTG
+* Designer/fabless (8): NVDA, AVGO, QCOM, AMD, TXN, MRVL, MPWR, LSCC
+* Deliberately excluded memory and foundry: their biggest players file as foreign issuers (20-F / IFRS, not on EDGAR). This is intentional scoping, not a gap, and I frame it that way in the writeup.
+
+
+KEY METHODOLOGY DECISIONS (and why)
+
+* EBITDA is operating income plus D&A. Defined explicitly, not lifted from a vendor's black-box field.
+* D&A must include amortization of acquired intangibles, not just physical depreciation. Otherwise acquisitive names (AVGO, AMD, MRVL, ENTG) get their EBITDA badly understated. I take the more complete of two candidates so nothing is silently dropped.
+* Debt excludes operating leases. My EBITDA is already struck after lease expense, so adding lease liabilities to EV would double-count them. (This is exactly where FMP had bundled them.) Debt is long-term debt plus finance leases only.
+* Cash is cash and equivalents only for the screen (marketable-securities tags were inconsistent even year to year). Liquidity gets refined by hand at the DCF stage where precision matters.
+* Market cap comes directly from the live price source (yfinance), never price times EDGAR shares, because a stock split between the last filing and today breaks that math (KLAC did a 10-for-1 split; the old method understated its market cap by 10x).
+* NVDA is my "oracle": a known-good reference I validate every layer against before trusting the other 13.
+
+
+WHAT WE DID, STEP BY STEP
+
+1. Scope and definitions
+    * Defined the 14-name universe and the equipment/designer split.
+    * Fixed EBITDA and EV definitions up front.
+
+2. Data-source pivot (FMP to SEC EDGAR)
+    * Started on Financial Modeling Prep; validated NVDA as the oracle.
+    * Scaling hit a 402 error on AMAT. A browser test proved FMP's free tier is symbol-gated (serves NVDA, paywalls the rest).
+    * Switched to SEC EDGAR's companyfacts API: free, primary-source, reproducible for anyone who clones the repo.
+
+3. EBITDA layer (the hard part, caught real bugs)
+    * KLAC pulled a stale 2014 filing, so I switched to selecting annual figures by period duration, not filing flags.
+    * Then found KLA stopped tagging operating income after 2015, so I reconstructed it from components (revenue minus cost of revenue minus R&D minus SG&A), validated against reported net income.
+    * AVGO, AMD, MRVL, and ENTG were dropping intangible amortization (AVGO alone about $8B), so I fixed it by taking the fuller of combined D&A versus depreciation plus intangibles.
+    * Result: 14 clean EBITDA figures, oracle holding at about 0.03%.
+
+4. EV-inputs layer (balance sheet)
+    * Added total debt, cash, and shares, pinned to the 10-K year-end.
+    * Debt excludes operating leases; cash is cash and equivalents only.
+    * Confirmed the 3 debt-free names (TER, MPWR, LSCC) are genuinely debt-free, not mis-parsed. All validated against the oracle.
+
+5. The screen
+    * Added live prices (yfinance, after Stooq's endpoint 404'd).
+    * Caught the worst bug: market cap as price times EDGAR shares broke for KLAC's post-filing 10-for-1 split, which made it look like the cheapest name (6x) when it's actually one of the priciest (about 56x). Fixed by pulling market cap directly from yfinance; added split detection.
+    * Verified the large market caps (AMD about $900B, and others) are a real 2026 AI melt-up, not data errors.
+
+
+FIRST READ OF THE SCREEN (how to interpret it)
+
+* The whole sector is historically expensive right now (equipment about 55x, designer about 48x median versus a normal 15x to 25x). This finds relative value inside an expensive sector, not absolute bargains.
+* A low multiple is not automatically a mispricing; usually it's the market pricing in lower growth or quality.
+* The designer median is distorted by mixing hyper-growth AI names with mature ones.
+* Watch-outs:
+    * AMD reads "n.m." correctly (over 120x trailing) because it's priced entirely on forward growth.
+    * TXN looks cheap (0.78 versus median) but that's a false cheap: its trailing EBITDA is temporarily depressed by fab-buildout depreciation, and 37x is actually rich for TXN historically.
+* Genuine cheap-versus-peers candidates worth a DCF:
+    * QCOM (14.9x): the standout. Cheap on smartphone-maturity and Apple modem-loss fears; bull case is underappreciated auto, IoT, and edge-AI diversification. A real "value or trap" question.
+    * ENTG (30.1x): cheapest equipment name. Is its discount to the AI-levered leaders (AMAT, KLAC) deserved (lower-margin materials supplier) or underpriced?
+    * Not TXN, despite its low multiple (explained above).
+
+
+ONE-SENTENCE DESCRIPTION OF THE PROJECT
+
+A reproducible pipeline that pulls semiconductor fundamentals straight from SEC filings, defends every definitional choice, and validates every layer against a known reference, so that data-quality traps (vendor black-boxes, tag inconsistency, stale filings, stock splits) get caught instead of silently corrupting the answer.
+
+
+WHAT'S NEXT
+
+* DCF on the flagged names (QCOM as the anchor, ENTG as the equipment counterpoint) to test whether their cheapness is deserved or a real mispricing. This turns the project from a screener into a full valuation.
