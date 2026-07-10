@@ -1,15 +1,18 @@
 """
-The screen itself: I bolt a live price onto my EDGAR financials to finish EV/EBITDA and rank
-each name against its SEGMENT median (equipment vs designer), since a fair comp set is
-segment-specific.
+The screen itself: I bolt a live market cap onto my EDGAR financials to finish EV/EBITDA and
+rank each name against its SEGMENT median (equipment vs designer).
 
-Price is the one input that isn't a filed figure -- it's a live market quote -- so its source
-doesn't need the reproducibility of EDGAR. I use yfinance: one batched call for all 14, and it
-rides over the endpoint fragility that broke my first (Stooq) attempt. The analytical content
-still comes entirely from EDGAR; this just stamps on today's price.
+Lesson learned the hard way: I must NOT compute market cap as price x shares-from-EDGAR. The
+EDGAR share count is as-of the last 10-K, but the price is live -- and if a name split or
+bought back stock in between (KLAC did a 10:1 split after its filing), the two don't match and
+market cap comes out wildly wrong. So I take market cap DIRECTLY from yfinance, where price and
+shares are one consistent live snapshot, and only use it split-safe. EV = live market cap +
+EDGAR net debt. I fetch each name one at a time to dodge the batch 'database is locked' issue.
 
-Reads data/processed/screener_base.csv (my financials) and writes data/processed/screener.csv.
+Reads data/processed/screener_base.csv and writes data/processed/screener.csv.
 """
+
+import time
 
 import pandas as pd
 import yfinance as yf
@@ -19,50 +22,71 @@ ROOT = Path(__file__).resolve().parent.parent
 BASE = ROOT / "data" / "processed" / "screener_base.csv"
 OUT = ROOT / "data" / "processed" / "screener.csv"
 
-NM_THRESHOLD = 100.0  # above this EV/EBITDA is "not meaningful" (trough-year names like LSCC)
+NM_THRESHOLD = 100.0
 
 
-def fetch_prices(tickers):
-    """Latest close for each ticker in one batched yfinance call. I pull a few days and take
-    the last available close so a single missing session doesn't leave a hole."""
-    data = yf.download(tickers, period="5d", progress=False, auto_adjust=False)
-    close = data["Close"] if "Close" in data.columns.get_level_values(0) else data
-    close = close.ffill()
-    last = close.iloc[-1]
-    out = {}
-    for t in tickers:
+def _fi_get(fi, *keys):
+    """fast_info key names vary by yfinance version, so I try a few spellings."""
+    for k in keys:
         try:
-            v = last[t]
-            out[t] = float(v) if pd.notna(v) else None
-        except Exception:
-            out[t] = None
-    return out
+            v = fi[k]
+            if v is not None:
+                return v
+        except (KeyError, TypeError):
+            pass
+        try:
+            v = getattr(fi, k)
+            if v is not None:
+                return v
+        except AttributeError:
+            pass
+    return None
+
+
+def market_data(ticker, retries=2):
+    """Live price, market cap, and share count for one ticker -- all from the same snapshot."""
+    for attempt in range(retries + 1):
+        try:
+            fi = yf.Ticker(ticker).fast_info
+            return {
+                "price": _fi_get(fi, "lastPrice", "last_price"),
+                "market_cap": _fi_get(fi, "marketCap", "market_cap"),
+                "yf_shares": _fi_get(fi, "shares", "shares_outstanding"),
+            }
+        except Exception as e:
+            if attempt == retries:
+                print(f"  {ticker}: fetch failed ({e})")
+                return {"price": None, "market_cap": None, "yf_shares": None}
+            time.sleep(0.5)
 
 
 def build_screen():
     df = pd.read_csv(BASE)
-    prices = fetch_prices(list(df["ticker"]))
 
-    mcaps, evs, multiples = [], [], []
+    md = {}
+    for t in df["ticker"]:
+        md[t] = market_data(t)
+        time.sleep(0.2)  # sequential + polite -> avoids the batch db-lock
+
+    df["price"] = df["ticker"].map(lambda t: md[t]["price"])
+    df["market_cap"] = df["ticker"].map(lambda t: md[t]["market_cap"])
+    df["yf_shares"] = df["ticker"].map(lambda t: md[t]["yf_shares"])
+
+    evs, mults = [], []
     for _, r in df.iterrows():
-        px = prices.get(r["ticker"])
-        if px is None or pd.isna(r["shares"]) or pd.isna(r["ebitda"]):
-            mcaps.append(None); evs.append(None); multiples.append(None)
-            continue
-        mcap = px * r["shares"]
-        ev = mcap + r["net_debt"]                  # net_debt = debt - cash (already signed)
-        mult = ev / r["ebitda"] if r["ebitda"] and r["ebitda"] > 0 else None
-        if mult is not None and (mult > NM_THRESHOLD or mult < 0):
-            mult = None                             # not meaningful (trough EBITDA / negative EV)
-        mcaps.append(mcap); evs.append(ev); multiples.append(mult)
-
-    df["price"] = df["ticker"].map(prices)
-    df["market_cap"] = mcaps
+        mc, nd, eb = r["market_cap"], r["net_debt"], r["ebitda"]
+        if pd.isna(mc) or pd.isna(nd) or pd.isna(eb):
+            evs.append(None); mults.append(None); continue
+        ev = mc + nd
+        m = ev / eb if eb and eb > 0 else None
+        if m is not None and (m > NM_THRESHOLD or m < 0):
+            m = None
+        evs.append(ev); mults.append(m)
     df["ev"] = evs
-    df["ev_ebitda"] = multiples
+    df["ev_ebitda"] = mults
 
     df["seg_median"] = df.groupby("segment")["ev_ebitda"].transform("median")
-    df["vs_median"] = df["ev_ebitda"] / df["seg_median"]  # <1 = cheaper than peers
+    df["vs_median"] = df["ev_ebitda"] / df["seg_median"]
 
     for seg in ["equipment", "designer"]:
         block = df[df["segment"] == seg].sort_values("ev_ebitda", na_position="last")
@@ -78,10 +102,19 @@ def build_screen():
             px = "--" if pd.isna(r["price"]) else f"{r['price']:.2f}"
             print(f"  {r['ticker']:6} {px:>9} {mc:>9} {ev:>9} {mult:>10} {vsm:>8}")
 
+    # Split / buyback watch: where my EDGAR share count and the live count diverge a lot,
+    # that's a split or big buyback since the last 10-K -- exactly what broke KLAC.
+    print("\nEDGAR vs live shares (ratio far from 1.0 = split/buyback since last 10-K):")
+    for _, r in df.iterrows():
+        if pd.notna(r["yf_shares"]) and pd.notna(r["shares"]) and r["shares"]:
+            ratio = r["yf_shares"] / r["shares"]
+            flag = "  <-- SPLIT/DRIFT" if (ratio > 1.2 or ratio < 0.83) else ""
+            print(f"  {r['ticker']:6} edgar={r['shares']/1e9:.3f}B  live={r['yf_shares']/1e9:.3f}B  ratio={ratio:.2f}{flag}")
+
     nv = df[df["ticker"] == "NVDA"].iloc[0]
     if pd.notna(nv["ev_ebitda"]):
         print(f"\nNVDA gut-check: EV/EBITDA {nv['ev_ebitda']:.1f}x, market cap "
-              f"${nv['market_cap']/1e9:.0f}B (earlier validation put this ~36x, ~$4.8T)")
+              f"${nv['market_cap']/1e9:.0f}B (validation: ~36x, ~$4.8T)")
 
     df.to_csv(OUT, index=False)
     print(f"\nSaved -> {OUT.relative_to(ROOT)}")
