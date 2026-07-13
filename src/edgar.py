@@ -4,8 +4,6 @@ My thin EDGAR client -- the shared plumbing the whole screener pulls financials 
 I keep the fetch / cache / tag logic here so both the spike and the dataset builder
 import one source of truth instead of duplicating it. Everything comes straight from
 SEC companyfacts, which is the primary source: the exact numbers in the 10-K.
-
-Name this file exactly edgar.py (lowercase) -- build_dataset.py imports it by that name.
 """
 
 import os
@@ -43,7 +41,21 @@ COMBINED_DA_TAGS = [
     "DepreciationAmortizationAndAccretionNet",
     "DepreciationAndAmortization",
 ]
-# ...if a filer splits it, bare Depreciation drops intangible amort, so I sum the pieces.
+
+# When a filer splits D&A, I have to catch every piece or I understate EBITDA. I used to sum
+# only Depreciation plus one amortization tag, and that missed AMD: they split their non
+# acquisition D&A across Depreciation (0.52B) AND OtherDepreciationAndAmortization (0.75B),
+# so I dropped 0.75B and reported AMD at 134x when the real figure is 120x. Same family of bug
+# as the Broadcom intangible amortization miss. So the depreciation side is now a SUM across
+# every tag the filer reports, not a first match.
+DEPRECIATION_TAGS = [
+    "Depreciation",
+    "OtherDepreciationAndAmortization",
+    "DepreciationNonproduction",
+]
+
+# The amortization side stays a FIRST MATCH. These tags are alternate spellings of the same
+# figure, not separate pieces of it, so summing them would double count.
 AMORT_TAGS = [
     "AmortizationOfIntangibleAssets",
     "AmortizationOfIntangibleAssetsAndOtherAmortization",
@@ -205,11 +217,17 @@ def operating_income_for(facts):
 def da_for_period(facts, end):
     """
     Total D&A for EBITDA at one period-end. I compute two candidates and take the more
-    complete one, so I never silently drop intangible amortization:
+    complete one, so I never silently drop a piece:
       A) the filer's single combined D&A line, if they report one
-      B) Depreciation + amortization of intangibles, summed from separate lines
+      B) every depreciation-side tag they report, SUMMED, plus amortization of intangibles
     max(A, B) is safe -- I never add A and B, so no double-count -- and it beats the
     Broadcom-style trap where a "combined" tag actually excludes intangible amort.
+
+    The depreciation side is a SUM, not a first match. AMD reports Depreciation and
+    OtherDepreciationAndAmortization as two separate lines, and taking only the first cost me
+    0.75B of EBITDA. The amortization side stays a first match because those tags are
+    alternate spellings of one figure, not separate pieces of it.
+
     Returns a dict with the chosen value plus both candidates for cross-checking.
     """
     a_val, a_tag = None, None
@@ -219,18 +237,26 @@ def da_for_period(facts, end):
             a_val, a_tag = v, tag
             break
 
-    dep = annual_value_for_end(facts, "Depreciation", end)
+    # Depreciation side: sum every tag that's present, and remember which ones fired.
+    dep_total, dep_parts = None, []
+    for tag in DEPRECIATION_TAGS:
+        v = annual_value_for_end(facts, tag, end)
+        if v is not None:
+            dep_total = (dep_total or 0) + v
+            dep_parts.append(tag)
+
+    # Amortization side: first match wins, since these are alternate names for one figure.
     amort, amort_tag = None, None
     for tag in AMORT_TAGS:
         x = annual_value_for_end(facts, tag, end)
         if x is not None:
             amort, amort_tag = x, tag
             break
+
     b_val, b_label = None, None
-    if dep is not None or amort is not None:
-        b_val = (dep or 0) + (amort or 0)
-        b_label = "+".join(p for p in [
-            "Depreciation" if dep is not None else None, amort_tag] if p)
+    if dep_total is not None or amort is not None:
+        b_val = (dep_total or 0) + (amort or 0)
+        b_label = "+".join(dep_parts + ([amort_tag] if amort_tag else []))
 
     if a_val is None and b_val is None:
         return None
@@ -241,7 +267,7 @@ def da_for_period(facts, end):
         value, label, method = a_val, a_tag, "combined"
 
     return {"value": value, "label": label, "method": method,
-            "combined": a_val, "summed": b_val}
+            "combined": a_val, "summed": b_val, "dep_parts": dep_parts}
 
 
 def ebitda_for(facts):
