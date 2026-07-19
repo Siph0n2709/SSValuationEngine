@@ -14,7 +14,7 @@ Two similar-looking results, but they don't survive the same test. Hold the exit
 
 So on QCOM the screen was misleading and the DCF caught it. On ENTG the DCF was out of its depth and the screen's relative ranking was the better read. Terminal value is 63.6% of enterprise value for QCOM and 73.6% for ENTG, which is the number that tells you which situation you're in before you run the test.
 
-Full reasoning is in [QCOM_DCF_Report.docx](reports/QCOM_DCF_Report.docx) and [ENTG_DCF_Report.docx](reports/ENTG_DCF_Report.docx).
+Full reasoning is in [QCOM_DCF_Report.docx](QCOM_DCF_Report.docx) and [ENTG_DCF_Report.docx](ENTG_DCF_Report.docx).
 
 ## Why EDGAR and not a data vendor
 
